@@ -41,26 +41,10 @@ def extract_organization(entity_id):
     return None
 
 
-def has_full_license_text(entity):
-    """Check if entity has full license text (>= 90% coverage)."""
-    scancode = entity.get('scancode', [])
-    if not scancode:
-        return False
-
-    for item in scancode:
-        origins = item.get('origins', [])
-        if not origins:
-            continue
-
-        for origin in origins:
-            coverage = origin.get('match_coverage', 0.0)
-            if coverage is None:
-                coverage = 0.0
-
-            if coverage >= THRESHOLD:
-                return True
-
-    return False
+# FLAW 1/2/4 FIX (v1.1): use shared_utils.has_full_license_text directly so
+# this script picks up the require_declared + precise per-origin scancode
+# checks that all other scripts use. The previous local implementation
+# duplicated the v1.0 logic and bypassed the v1.1 fixes.
 
 
 def has_copyright_notice(entity):
@@ -121,7 +105,7 @@ def analyze_organizations(entities, org_list):
         # Analyze ALL HuggingFace assets first
         org_assets[org]['total_all'] += 1
 
-        has_license = has_full_license_text(entity)
+        has_license = shared_utils.has_full_license_text(entity, THRESHOLD)
         has_copyright = has_copyright_notice(entity)
 
         if has_license:

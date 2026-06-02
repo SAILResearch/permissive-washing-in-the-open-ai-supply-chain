@@ -109,23 +109,81 @@ def extract_licenses_scancode(entity: Dict) -> List[str]:
     return licenses
 
 
+def split_license_expression(expr):
+    """
+    FLAW 2 FIX (v1.1) — Decompose an SPDX-style license expression into its
+    OPERAND set, splitting on AND and OR. WITH is preserved (because
+    "GPL-3.0-only WITH GCC-exception-3.1" carries meaningful exception info
+    that should be kept as a single token). Parens and trailing '+' are stripped.
+
+    Returns a set of lowercased operand strings.
+
+    Examples:
+        "MIT"                              -> {"mit"}
+        "MIT AND Apache-2.0"               -> {"mit", "apache-2.0"}
+        "(BSD-3-Clause OR Apache-2.0)"     -> {"bsd-3-clause", "apache-2.0"}
+        "GPL-3.0-only WITH GCC-exception-3.1"
+                                           -> {"gpl-3.0-only with gcc-exception-3.1"}
+        "Apache-2.0 AND (MIT OR BSD-3-Clause)"
+                                           -> {"apache-2.0", "mit", "bsd-3-clause"}
+    """
+    if expr is None:
+        return set()
+    if isinstance(expr, (list, set, tuple)):
+        out = set()
+        for e in expr:
+            out |= split_license_expression(e)
+        return out
+    if not isinstance(expr, str):
+        return set()
+
+    s = expr.strip()
+    if not s:
+        return set()
+
+    # Lowercase for splitting on operators, but only on AND/OR (not WITH).
+    lower = s.lower()
+    # Strip parens
+    lower = lower.replace('(', ' ').replace(')', ' ')
+    # Split on AND / OR (word-bounded) via sentinel separator.
+    SEP = '\x1f'
+    padded = ' ' + lower + ' '
+    padded = padded.replace(' and ', SEP).replace(' or ', SEP)
+    parts = [p.strip() for p in padded.split(SEP)]
+    out = set()
+    for p in parts:
+        if not p:
+            continue
+        # Drop trailing '+' (license-version-or-later marker)
+        if p.endswith('+'):
+            p = p[:-1].rstrip()
+        # Drop stray commas/semicolons
+        p = p.strip(' ,;')
+        if p:
+            out.add(p)
+    return out
+
+
 def has_target_license(licenses: List[str], targets: Set[str] = None) -> bool:
     """
     Check if entity has any of the target licenses (MIT/Apache/BSD).
 
+    FLAW 2 FIX (v1.1): decomposes each declared license entry through
+    split_license_expression() so that compound entries like
+    "MIT AND Apache-2.0" are treated as containing both MIT and Apache-2.0.
+
     Args:
-        licenses: List of license identifiers
+        licenses: List of license identifiers (each may be a compound SPDX expr)
         targets: Set of target licenses (default: MIT, Apache-2.0, BSD-3-Clause)
 
     Returns:
-        True if any target license is present
+        True if any operand of any declared license entry is in targets.
     """
     if targets is None:
         targets = {'MIT', 'Apache-2.0', 'BSD-3-Clause'}
-
-    # Normalize both to lowercase for comparison
     targets_lower = {t.lower() for t in targets}
-    return any(lic.lower() in targets_lower for lic in licenses)
+    declared_operands = split_license_expression(licenses)
+    return bool(declared_operands & targets_lower)
 
 
 # ============================================================================
@@ -455,29 +513,108 @@ def categorize_file_type(file_path: str) -> str:
     return 'OTHER'
 
 
-def has_full_license_text(entity: Dict, threshold: float = 90.0) -> bool:
+def has_full_license_text(entity: Dict, threshold: float = 90.0,
+                          require_declared: bool = True,
+                          precise: bool = True) -> bool:
     """
     Check if entity has full license text (match_coverage >= threshold).
 
+    FLAW 1 FIX (v1.1, require_declared=True default):
+        Require the matched scancode entry's license_expression_spdx to
+        reference at least one of the entity's DECLARED license labels.
+        Without this, an entity declared "MIT" could pass on an Apache-2.0
+        full-text match in an unrelated file.
+
+    FLAW 4 FIX (v1.1, precise=True default — requires v1.1+ dataset):
+        Use the per-origin `match_license_expression` /
+        `match_license_expression_spdx` and `rule_category` fields (added
+        by build_v3_precise_scancode.py) to verify the SPECIFIC origin's
+        matched license is one of the declared licenses AND that origin's
+        rule was a FULL_TEXT rule. This eliminates the compound-license
+        ambiguity where the per-origin match_coverage of a compound entry
+        like "MIT AND CC-BY-4.0" can't be attributed to the right
+        sub-license under the v1.0 schema.
+
+        Falls back to the legacy entry-level check on origins that don't
+        carry the new fields (backward-compatible with v1.0 datasets).
+
     Args:
-        entity: Entity dictionary with 'scancode' field
+        entity: Entity dictionary with 'scancode' and 'licenses' fields
         threshold: Minimum match coverage percentage (default: 90.0)
+        require_declared: If True (default), require the matched license to
+            equal one of the entity's declared licenses. Set False to
+            reproduce the legacy v1.0 paper behaviour.
+        precise: If True (default), use per-origin license/rule_category
+            for verification on v1.1+ datasets. Set False to reproduce
+            v1.0 (entry-level only) behaviour.
 
     Returns:
-        True if any license has match_coverage >= threshold
+        True if any license has match_coverage >= threshold AND (if
+        require_declared) the matched license matches one of the entity's
+        declared licenses.
     """
     scancode = entity.get('scancode', [])
     if scancode is None:
         return False
 
+    declared_operands = set()
+    if require_declared:
+        # FLAW 2 FIX: decompose declared licenses (which may be compound SPDX
+        # expressions like "MIT AND Apache-2.0") into operand set.
+        declared_operands = split_license_expression(entity.get('licenses') or [])
+        if not declared_operands:
+            return False
+
     for item in scancode:
-        origins = item.get('origins', [])
-        for origin in origins:
+        if require_declared:
+            spdx = item.get('license_expression_spdx') or ''
+            if not spdx:
+                continue
+            # Decompose the scancode expression the same way so that a
+            # per-license item like 'MIT' will match a declared
+            # 'MIT AND Apache-2.0', and a compound scancode item like
+            # 'MIT AND Apache-2.0' will match a declared 'MIT'.
+            scancode_operands = split_license_expression(spdx)
+            if not (declared_operands & scancode_operands):
+                continue
+
+        for origin in item.get('origins', []) or []:
             coverage = origin.get('match_coverage', 0.0)
-            # Handle None case (different pattern found but no full match) - treat as 0
             if coverage is None:
                 coverage = 0.0
-            if coverage >= threshold:
+            if coverage < threshold:
+                continue
+
+            if precise and ('match_license_expression_spdx' in origin
+                            or 'match_license_expression' in origin):
+                # FLAW 4 (precise) mode: require the SPECIFIC match to be for
+                # one of the declared licenses AND be a FULL_TEXT category.
+                #
+                # Compare against the SPDX form of the match's license, not
+                # the internal ScanCode key — the entity's declared
+                # `licenses` is in SPDX form (e.g. 'BSD-3-Clause') but the
+                # match's `license_expression` is internal (e.g. 'bsd-new').
+                # Falls back to internal key for older records without the
+                # spdx field.
+                spdx = origin.get('match_license_expression_spdx')
+                if spdx:
+                    match_operands = split_license_expression(spdx)
+                else:
+                    match_operands = {
+                        (origin.get('match_license_expression') or '').lower()
+                    }
+                    match_operands.discard('')
+                if not match_operands:
+                    continue
+                if require_declared and not (match_operands & declared_operands):
+                    continue
+                if origin.get('rule_category') != 'FULL_TEXT':
+                    # The match was a TAG/NOTICE/REFERENCE — not the actual
+                    # license text. Only FULL_TEXT counts.
+                    continue
+                return True
+            else:
+                # Legacy path (v1.0 data without per-origin precision)
                 return True
 
     return False
